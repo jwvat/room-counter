@@ -1,47 +1,60 @@
 import { redis, KEY } from "./_redis.js";
 
 export default async function handler(req, res) {
-  // Nur POST-Anfragen akzeptieren
-  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
+  // Sowohl GET (für Camlytics-URL-Only) als auch POST erlauben
+  if (req.method !== "GET" && req.method !== "POST") {
+    return res.status(405).json({ error: "Method Not Allowed" });
+  }
 
-  // Ein einfaches Sicherheits-Token im Header prüfen
-  // → Nur Anfragen mit korrektem Token dürfen zählen
-  const token = req.headers["x-webhook-token"];
+  // 1) Auth:
+  //    - bevorzugt: Header "X-Webhook-Token" (POST-Fall)
+  //    - alternativ: Query ?token=DEINSECRET (GET/URL-only)
+  const headerToken = req.headers["x-webhook-token"];
+  const queryToken = req.query?.token;
+  const token = headerToken || queryToken;
   if (!token || token !== process.env.WEBHOOK_TOKEN) {
-    return res.status(401).send("Unauthorized");
+    return res.status(401).json({ error: "Unauthorized" });
   }
 
-  // Daten aus der Anfrage lesen (z. B. {"direction":"in","count":1})
-  const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
-  const dir = body.direction;          // "in" = rein, "out" = raus
-  const step = Number(body.count ?? 1); // Anzahl der Personen (Standard: 1)
+  // 2) Parameter holen
+  //    - aus Query (GET) oder Body (POST)
+  let dir, step;
+  if (req.method === "GET") {
+    dir = (req.query?.dir || "").toLowerCase();               // "in" | "out"
+    step = Number(req.query?.count ?? 1);                      // Anzahl
+  } else {
+    const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
+    dir = (body.direction || "").toLowerCase();
+    step = Number(body.count ?? 1);
+  }
 
-  // Prüfen, ob die Werte gültig sind
+  // 3) Validieren
   if (!["in", "out"].includes(dir) || !Number.isFinite(step) || step <= 0) {
-    return res.status(400).send("Bad Request");
+    return res.status(400).json({ error: "Bad Request", hint: "Use dir=in|out and count>=1" });
   }
 
-  // Wenn jemand reinkommt → +1, wenn raus → -1
+  // 4) Delta berechnen (+ für 'in', - für 'out')
   const delta = dir === "in" ? step : -step;
 
-  // Der folgende Code ändert den Wert sicher in der Datenbank
-  // und sorgt dafür, dass der Zähler nie unter 0 fällt
-  const newVal = await redis.eval(
-    `
-    local key=KEYS[1]
-    local delta=tonumber(ARGV[1])
-    local v=redis.call("GET", key)
-    if not v then v=0 else v=tonumber(v) end
-    v=v+delta
-    if v<0 then v=0 end
-    redis.call("SET", key, v)
-    return v
-    `,
-    [KEY],
-    [String(delta)]
-  );
+  try {
+    // 5) Atomar in Redis ändern, nie unter 0 fallen lassen
+    const newVal = await redis.eval(
+      `
+      local key=KEYS[1]
+      local delta=tonumber(ARGV[1])
+      local v=redis.call("GET", key)
+      if not v then v=0 else v=tonumber(v) end
+      v=v+delta
+      if v<0 then v=0 end
+      redis.call("SET", key, v)
+      return v
+      `,
+      [KEY],
+      [String(delta)]
+    );
 
-  // Den neuen Stand zurückgeben
-  res.setHeader("Content-Type", "application/json");
-  res.status(200).send(JSON.stringify({ count: Number(newVal) }));
+    return res.status(200).json({ ok: true, count: Number(newVal) });
+  } catch (e) {
+    return res.status(500).json({ error: "UPDATE_FAILED", message: String(e?.message || e) });
+  }
 }
