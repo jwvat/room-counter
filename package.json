@@ -1,0 +1,8 @@
+{
+  "name": "room-counter",      // Projektname
+  "private": true,
+  "type": "module",            // moderne JavaScript-Variante
+  "dependencies": {
+    "@upstash/redis": "^1.30.0" // Datenbank für Zähler (kostenfrei über Upstash)
+  }
+}
